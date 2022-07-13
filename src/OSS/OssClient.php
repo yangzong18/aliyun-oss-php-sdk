@@ -147,6 +147,18 @@ class OssClient
         $options[self::OSS_BUCKET] = '';
         $options[self::OSS_METHOD] = self::OSS_HTTP_GET;
         $options[self::OSS_OBJECT] = '/';
+        $query = isset($options[self::OSS_QUERY_STRING]) ? $options[self::OSS_QUERY_STRING] : array();
+        $options[self::OSS_QUERY_STRING] = array_merge(
+            $query,
+            array(
+                self::OSS_PREFIX => isset($options[self::OSS_PREFIX]) ? $options[self::OSS_PREFIX] : '',
+                self::OSS_MAX_KEYS => isset($options[self::OSS_MAX_KEYS]) ? $options[self::OSS_MAX_KEYS] : self::OSS_MAX_KEYS_VALUE,
+                self::OSS_MARKER => isset($options[self::OSS_MARKER]) ? $options[self::OSS_MARKER] : '',
+                self::OSS_TAG_KEY => isset($options[self::OSS_TAG_KEY]) ? $options[self::OSS_TAG_KEY] : '',
+                self::OSS_TAG_VALUE => isset($options[self::OSS_TAG_VALUE]) ? $options[self::OSS_TAG_VALUE] : ''
+            )
+
+        );
         $response = $this->auth($options);
         $result = new ListBucketsResult($response);
         return $result->getData();
@@ -3560,6 +3572,8 @@ class OssClient
     const OSS_PREFIX = 'prefix';
     const OSS_DELIMITER = 'delimiter';
     const OSS_MARKER = 'marker';
+    const OSS_TAG_KEY = 'tag-key';
+    const OSS_TAG_VALUE = 'tag-value';
     const OSS_FETCH_OWNER = 'fetch-owner';
     const OSS_START_AFTER = 'start-after';
     const OSS_CONTINUATION_TOKEN = 'continuation-token';
