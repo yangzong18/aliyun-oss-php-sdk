@@ -170,6 +170,17 @@ class RequestCore
     public $registered_streaming_write_callback = null;
 
     /**
+     * The user-defined callback function to call when need to show progress bar.
+     */
+    public $registered_progress_callback = null;
+
+
+    /**
+     * @var null
+     */
+    public $callback_context = null;
+
+    /**
      * The request timeout time, which is 5,184,000 seconds,that is, 6 days by default
      *
      * @var int
@@ -552,6 +563,34 @@ class RequestCore
     }
 
 
+    /**
+     * Register a callback function to execute whenever a progress to using
+     * @param string|array|function $callback (Required) The callback function is called by <php:call_user_func()>, so you can pass the following values: <ul>
+     * <li>The name of a global function to execute, passed as a string.</li>
+     *    <li>A method to execute, passed as <code>array('ClassName', 'MethodName')</code>.</li>
+     *    <li>An anonymous function (PHP 5.3+).</li></ul>
+     * @return $this A reference to the current instance.
+     */
+    public function register_progress_callback($callback)
+    {
+        $this->registered_progress_callback = $callback;
+        return $this;
+    }
+
+
+    /**
+     * A callback function that is invoked by cURL for progress.
+     * @param resource $curl_handle (Required) The cURL handle for the request.
+     * @param int $download_size (Required) download size
+     * @param int $downloaded (Required) downloaded size
+     * @param int $upload_size upload size B
+     */
+    public function streaming_progress_callback($curl_handle, $download_size,$downloaded,$upload_size,$uploaded){
+        if ($this->registered_progress_callback) {
+            call_user_func($this->registered_progress_callback, $curl_handle, $download_size, $downloaded,$upload_size,$uploaded);
+        }
+    }
+
     /*%******************************************************************************************%*/
     // PREPARE, SEND, AND PROCESS REQUEST
 
@@ -611,7 +650,6 @@ class RequestCore
         $length = strlen($data);
         $written_total = 0;
         $written_last = 0;
-        
         while ($written_total < $length) {
             $written_last = fwrite($this->write_stream, substr($data, $written_total));
 
@@ -656,6 +694,11 @@ class RequestCore
         curl_setopt($curl_handle, CURLOPT_USERAGENT, $this->useragent);
         curl_setopt($curl_handle, CURLOPT_HEADERFUNCTION, array($this, 'streaming_header_callback'));
         curl_setopt($curl_handle, CURLOPT_READFUNCTION, array($this, 'streaming_read_callback'));
+
+        if($this->registered_progress_callback){
+            curl_setopt($curl_handle, CURLOPT_NOPROGRESS, false);
+            curl_setopt($curl_handle, CURLOPT_PROGRESSFUNCTION, array($this, 'streaming_progress_callback'));
+        }
 
         // Verification of the SSL cert
         if ($this->ssl_verification) {

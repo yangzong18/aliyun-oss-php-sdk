@@ -3047,6 +3047,10 @@ class OssClient
             $headers[self::OSS_CONTENT_MD5] = base64_encode(md5($options[self::OSS_CONTENT], true));
         }
 
+        if (isset($options[self::OSS_REGISTERED_PROGRESS_CALLBACK])){
+            $request->register_progress_callback($options[self::OSS_REGISTERED_PROGRESS_CALLBACK]);
+        }
+
         if (isset($options[self::OSS_CALLBACK])) {
             $headers[self::OSS_CALLBACK] = base64_encode($options[self::OSS_CALLBACK]);
         }
@@ -3651,6 +3655,8 @@ class OssClient
     
     const OSS_LIST_TYPE = "list-type";
 
+    const OSS_REGISTERED_PROGRESS_CALLBACK = 'register-progress-callback';
+    const OSS_CALLBACK_CONTEXT = 'callback-context';
     // Domain Types
     const OSS_HOST_TYPE_NORMAL = "normal";//http://bucket.oss-cn-hangzhou.aliyuncs.com/object
     const OSS_HOST_TYPE_IP = "ip";  //http://1.1.1.1/bucket/object
