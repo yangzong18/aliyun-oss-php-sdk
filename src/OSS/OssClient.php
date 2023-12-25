@@ -1668,7 +1668,6 @@ class OssClient
                 self::OSS_MAX_KEYS => isset($options[self::OSS_MAX_KEYS]) ? $options[self::OSS_MAX_KEYS] : self::OSS_MAX_KEYS_VALUE,
                 self::OSS_MARKER => isset($options[self::OSS_MARKER]) ? $options[self::OSS_MARKER] : '')
         );
-
         $response = $this->auth($options);
         $result = new ListObjectsResult($response);
         return $result->getData();
@@ -1936,7 +1935,8 @@ class OssClient
         $options[self::OSS_BUCKET] = $bucket;
         $options[self::OSS_OBJECT] = $object;
         if (!isset($options[self::OSS_CONTENT_LENGTH])) {
-            $options[self::OSS_CONTENT_LENGTH] = fstat($handle)[self::OSS_SIZE];
+            $stat = fstat($handle);
+            $options[self::OSS_CONTENT_LENGTH] = $stat[self::OSS_SIZE];
         }
         $response = $this->auth($options);
         $result = new PutSetDeleteResult($response);
@@ -3105,6 +3105,9 @@ class OssClient
         $response_header['oss-redirects'] = $this->redirects;
         $response_header['oss-stringtosign'] = $request->string_to_sign;
         $response_header['oss-requestheaders'] = $request->request_headers;
+        if ($this->authVersion == self::OSS_AUTH_V4) {
+            $response_header['oss-canonicalrequest'] = $request->canonical_request;
+        }
 
         $data = new ResponseCore($response_header, $request->get_response_body(), $request->get_response_code());
         //retry if OSS Internal Error
@@ -3211,17 +3214,13 @@ class OssClient
             if (!isset($request->request_headers[self::OSS_CONTENT_SHA256])) {
                 $request->add_header(self::OSS_CONTENT_SHA256, self::OSS_DEFAULT_CONTENT_SHA256);
             }
-            $strDate = $request->request_headers[self::OSS_DATE];
-            if (gettype($strDate) == 'integer') {
-                $strDate = gmdate('D, d M Y H:i:s \G\M\T', $strDate);
-            }
             $credential = $this->getScope($cred->getAccessKeyId());
             list($additionalList, $additionalMap) = $this->getAdditionalHeaderKeysV4($headers);
             $additional = "";
             if (count($additionalList) > 0) {
                 $additional = implode(";", $additionalList);
             }
-            $signature = $this->getSignedStrV4($request, $sign_resource, $cred->getAccessKeySecret());
+            $signature = $this->getSignatureV4($request, $sign_resource, $cred->getAccessKeySecret(), $additionalList);
             if (strlen($additional) > 0) {
                 $authorizationFmt = "OSS4-HMAC-SHA256 Credential=%s,AdditionalHeaders=%s,Signature=%s";
                 $authorizationStr = sprintf(
@@ -3258,8 +3257,6 @@ class OssClient
             $signature = base64_encode(hash_hmac('sha1', $string_to_sign, $cred->getAccessKeySecret(), true));
             $query_string = self::OSS_URL_ACCESS_KEY_ID . '=' . rawurlencode($cred->getAccessKeyId()) . '&' . self::OSS_URL_EXPIRES . '=' . $options[self::OSS_PREAUTH] . '&' . self::OSS_URL_SIGNATURE . '=' . rawurlencode($signature);
         } else {
-            $strDate = $headers[self::OSS_DATE];
-            $express = $strDate - time();
             $credential = $this->getScope($cred->getAccessKeyId());
             list($additionalList, $additionalMap) = $this->getAdditionalHeaderKeysV4($headers);
             $additional = "";
@@ -3271,17 +3268,14 @@ class OssClient
             if (isset($headers[self::OSS_CONTENT_SHA256]) && strlen($headers[self::OSS_CONTENT_SHA256]) > 0) {
                 $hashedPayload = $headers[self::OSS_CONTENT_SHA256];
             }
-            $subPos = strrpos($sign_resource, "?");
-            $subResource = "";
-            if ($subPos !== false) {
-                $subResource = substr($sign_resource, $subPos + 1);
-                $resource = substr($sign_resource, 0, $subPos);
-            }
-            $canonicalRequest = $options[self::OSS_METHOD] . "\n" . $resource . "\n" . $subResource . "\n" . $canonicalOSSHeaders . "\n" . implode(";", $additionalList) . "\n" . $hashedPayload;
+            $canonicalRequest = $this->getCanonicalRequest($options[self::OSS_METHOD], $sign_resource, $canonicalOSSHeaders, $additionalList, $hashedPayload);
 //            printf("canonical request:%s".PHP_EOL,$canonicalRequest);
-            $hashedRequest = hash('sha256', $canonicalRequest);
-            $signature = $this->getSignatureV4($hashedRequest, $cred->getAccessKeySecret());
+            $strDay = date("Ymd");
+            $strDate = gmdate('Ymd\THis\Z');
+            $signStr = $this->getSignedStrV4($strDate, $strDay, $canonicalRequest);
+            $signature = $this->getHashSignature($cred->getAccessKeySecret(), $strDay, $signStr);
             $isoTime = gmdate('Ymd\THis\Z');
+            $express = $headers[self::OSS_DATE] - time();
             $query_string = rawurlencode('x-oss-date') . '=' . rawurlencode($isoTime) . '&' . rawurlencode('x-oss-expires') . '=' . rawurlencode($express) . '&' . rawurlencode('x-oss-signature-version') . '=' . rawurlencode('OSS4-HMAC-SHA256') . '&' . rawurlencode('x-oss-credential') . '=' . rawurlencode($credential);
             if (strlen($additional) > 0) {
                 $query_string .= '&' . rawurlencode('x-oss-additional-headers') . '=' . rawurlencode($additional);
@@ -3290,7 +3284,6 @@ class OssClient
         }
         return $query_string;
     }
-
 
     /**
      * Get sign string v1
@@ -3376,40 +3369,39 @@ class OssClient
 
     /**
      * Get Signature V4
-     * @param $hashedRequest string
      * @param $keySecret string
+     * @param $strDay
+     * @param $region
+     * @param $product
+     * @param $signStr
      * @return string
      */
-    private function getSignatureV4($hashedRequest, $keySecret)
+    private function getHashSignature($keySecret, $strDay, $signStr)
     {
-        $strDay = date("Ymd");
-        $strDate = gmdate('Ymd\THis\Z');
-        $sign_product = $this->getProduct();
+        $product = $this->getProduct();
         if (!$this->region) {
             $result = explode(".", $this->hostname);
             $region = str_replace("oss-", "", $result[0]);
             $this->setRegion($region);
         }
-        $sign_region = $this->getRegion();
-        $signStr = "OSS4-HMAC-SHA256" . "\n" . $strDate . "\n" . $strDay . "/" . $sign_region . "/" . $sign_product . "/aliyun_v4_request" . "\n" . $hashedRequest;
+        $region = $this->getRegion();
         $h1Key = hash_hmac("sha256", $strDay, "aliyun_v4" . $keySecret, true);
-        $h2Key = hash_hmac("sha256", $sign_region, $h1Key, true);
-        $h3Key = hash_hmac("sha256", $sign_product, $h2Key, true);
+        $h2Key = hash_hmac("sha256", $region, $h1Key, true);
+        $h3Key = hash_hmac("sha256", $product, $h2Key, true);
         $h4Key = hash_hmac("sha256", "aliyun_v4_request", $h3Key, true);
         return bin2hex(hash_hmac("sha256", $signStr, $h4Key, true));
     }
 
     /**
-     * Get Sign str for v4
+     * Get Signature for v4
      * @param $request RequestCore
      * @param $resource string
      * @param $secret string Access Key Secret
      * @return string
      */
-    private function getSignedStrV4($request, $resource, $secret)
+    private function getSignatureV4($request, $resource, $secret, $additionalList)
     {
         $headers = $request->request_headers;
-        list($additionalList, $additionalMap) = $this->getAdditionalHeaderKeysV4($headers);
         $strDate = $request->request_headers[self::OSS_DATE];
         if (gettype($strDate) == 'integer') {
             $strDate = gmdate('D, d M Y H:i:s \G\M\T', $strDate);
@@ -3421,30 +3413,53 @@ class OssClient
         if (isset($headers[self::OSS_CONTENT_SHA256]) && strlen($headers[self::OSS_CONTENT_SHA256]) > 0) {
             $hashedPayload = $headers[self::OSS_CONTENT_SHA256];
         }
+        $canonicalRequest = $this->getCanonicalRequest($request->method, $resource, $canonicalOSSHeaders, $additionalList, $hashedPayload);
+        $request->canonical_request = $canonicalRequest;
+        $signStr = $this->getSignedStrV4($strDate, $strDay, $canonicalRequest);
+        $request->string_to_sign = $signStr;
+        return $this->getHashSignature($secret, $strDay, $signStr);
+    }
+
+    /**
+     * Get Sign String For V4
+     *
+     * @param $strDate string
+     * @param $strDay string
+     * @param $canonicalRequest string
+     * @return string
+     */
+    private function getSignedStrV4($strDate, $strDay, $canonicalRequest)
+    {
+        $hashedRequest = hash('sha256', $canonicalRequest);
+        $product = $this->getProduct();
+        if (!$this->region) {
+            $result = explode(".", $this->hostname);
+            $region = str_replace("oss-", "", $result[0]);
+            $this->setRegion($region);
+        }
+        $region = $this->getRegion();
+        return "OSS4-HMAC-SHA256" . "\n" . $strDate . "\n" . $strDay . "/" . $region . "/" . $product . "/aliyun_v4_request" . "\n" . $hashedRequest;
+    }
+
+    /**
+     * Get Canonical Request
+     * @param $method string
+     * @param $resource string
+     * @param $canonicalOSSHeaders string
+     * @param $additionalList array
+     * @param $hashedPayload string
+     * @return string
+     */
+    private function getCanonicalRequest($method, $resource, $canonicalOSSHeaders, $additionalList, $hashedPayload)
+    {
         $subPos = strrpos($resource, "?");
         $subResource = "";
         if ($subPos !== false) {
             $subResource = substr($resource, $subPos + 1);
             $resource = substr($resource, 0, $subPos);
         }
-        $canonicalRequest = $request->method . "\n" . $resource . "\n" . $subResource . "\n" . $canonicalOSSHeaders . "\n" . implode(";", $additionalList)
+        return $method . "\n" . $resource . "\n" . $subResource . "\n" . $canonicalOSSHeaders . "\n" . implode(";", $additionalList)
             . "\n" . $hashedPayload;
-//        printf("canonical request:%s".PHP_EOL,$canonicalRequest);
-        $hashedRequest = hash('sha256', $canonicalRequest);
-        $sign_product = $this->getProduct();
-        if (!$this->region) {
-            $result = explode(".", $this->hostname);
-            $region = str_replace("oss-", "", $result[0]);
-            $this->setRegion($region);
-        }
-        $sign_region = $this->getRegion();
-        $signStr = "OSS4-HMAC-SHA256" . "\n" . $strDate . "\n" . $strDay . "/" . $sign_region . "/" . $sign_product . "/aliyun_v4_request" . "\n" . $hashedRequest;
-        $request->string_to_sign = $signStr;
-        $h1Key = hash_hmac("sha256", $strDay, "aliyun_v4" . $secret, true);
-        $h2Key = hash_hmac("sha256", $sign_region, $h1Key, true);
-        $h3Key = hash_hmac("sha256", $sign_product, $h2Key, true);
-        $h4Key = hash_hmac("sha256", "aliyun_v4_request", $h3Key, true);
-        return bin2hex(hash_hmac("sha256", $signStr, $h4Key, true));
     }
 
     /**
@@ -3772,7 +3787,7 @@ class OssClient
     private function generatePath($options)
     {
         $path = "";
-        // path => /bucket/object
+        //other=>/object | ip=>/bucket/object
         if (isset($options[self::OSS_BUCKET]) && '' !== $options[self::OSS_BUCKET]) {
             if ($this->hostType === self::OSS_HOST_TYPE_IP) {
                 $path = '/' . $options[self::OSS_BUCKET];
@@ -3785,7 +3800,7 @@ class OssClient
     }
 
     /**
-     * Initialize request path
+     * Initialize request query
      *
      * @param $options array
      * @return string
@@ -3871,18 +3886,20 @@ class OssClient
     }
 
     /**
+     * Check Credentials Params
      * @param Credentials $credential
-     * @return OssException
+     * @return void
+     * @throws OssException
      */
     private function checkCredentials($credential)
     {
         if (empty($credential)) {
             throw new OssException("credentials is empty.");
         }
-        if (empty($credential->getAccessKeyId())) {
+        if (strlen($credential->getAccessKeyId()) == 0) {
             throw new OssException("access key id is empty");
         }
-        if (empty($credential->getAccessKeySecret())) {
+        if (strlen($credential->getAccessKeySecret()) == 0) {
             throw new OssException("access key secret is empty");
         }
     }
@@ -4117,28 +4134,15 @@ class OssClient
     private $region = null;
     private $additionalHeaders = array();
     private $signKeyList = array(
-        "acl", "uploads", "location", "cors",
-        "logging", "website", "referer", "lifecycle",
-        "delete", "append", "tagging", "objectMeta",
-        "uploadId", "partNumber", "security-token", "x-oss-security-token",
-        "position", "img", "style", "styleName",
-        "replication", "replicationProgress",
-        "replicationLocation", "cname", "bucketInfo",
-        "comp", "qos", "live", "status", "vod",
-        "startTime", "endTime", "symlink",
-        "x-oss-process", "response-content-type", "x-oss-traffic-limit",
-        "response-content-language", "response-expires",
-        "response-cache-control", "response-content-disposition",
-        "response-content-encoding", "udf", "udfName", "udfImage",
-        "udfId", "udfImageDesc", "udfApplication", "comp",
-        "udfApplicationLog", "restore", "callback", "callback-var", "qosInfo",
-        "policy", "stat", "encryption", "versions", "versioning", "versionId", "requestPayment",
-        "x-oss-request-payer", "sequential",
-        "inventory", "inventoryId", "continuation-token", "asyncFetch",
-        "worm", "wormId", "wormExtend", "withHashContext",
-        "x-oss-enable-md5", "x-oss-enable-sha1", "x-oss-enable-sha256",
-        "x-oss-hash-ctx", "x-oss-md5-ctx", "transferAcceleration",
-        "regionList", "cloudboxes", "x-oss-ac-source-ip", "x-oss-ac-subnet-mask", "x-oss-ac-vpc-id", "x-oss-ac-forward-allow",
-        "metaQuery", "resourceGroup", "rtc", "x-oss-async-process", "responseHeader"
+        "acl", "uploads", "location", "cors", "logging", "website", "referer", "lifecycle",
+        "delete", "append", "tagging", "objectMeta", "uploadId", "partNumber", "security-token", "x-oss-security-token",
+        "position", "img", "style", "styleName", "replication", "replicationProgress", "replicationLocation", "cname", "bucketInfo", "comp", "qos",
+        "live", "status", "vod", "startTime", "endTime", "symlink", "x-oss-process", "response-content-type", "x-oss-traffic-limit", "response-content-language",
+        "response-expires", "response-cache-control", "response-content-disposition", "response-content-encoding", "udf", "udfName", "udfImage",
+        "udfId", "udfImageDesc", "udfApplication", "udfApplicationLog", "restore", "callback", "callback-var", "qosInfo",
+        "policy", "stat", "encryption", "versions", "versioning", "versionId", "requestPayment", "x-oss-request-payer", "sequential",
+        "inventory", "inventoryId", "continuation-token", "asyncFetch", "worm", "wormId", "wormExtend", "withHashContext", "x-oss-enable-md5", "x-oss-enable-sha1",
+        "x-oss-enable-sha256", "x-oss-hash-ctx", "x-oss-md5-ctx", "transferAcceleration", "regionList", "cloudboxes", "x-oss-ac-source-ip", "x-oss-ac-subnet-mask",
+        "x-oss-ac-vpc-id", "x-oss-ac-forward-allow", "metaQuery", "resourceGroup", "rtc", "x-oss-async-process", "responseHeader"
     );
 }

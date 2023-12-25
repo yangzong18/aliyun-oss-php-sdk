@@ -189,6 +189,12 @@ class RequestCore
      */
     public $string_to_sign;
 
+    /**
+     * Canonical Request
+     * @var string
+     */
+    public $canonical_request;
+
     /*%******************************************************************************************%*/
     // CONSTANTS
 
